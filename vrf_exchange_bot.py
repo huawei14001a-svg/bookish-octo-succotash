@@ -2063,11 +2063,13 @@ async def _execute_scam_transfer(context, chat_id: int, cmd_msg_id: int,
     loop = asyncio.get_running_loop()
     img = await loop.run_in_executor(None, _scam_card_image_sync, amount)
 
-    # Просто жирный текст — визуальная "цитата" обеспечивается нативной функцией
-    # Telegram (reply_parameters.quote) ниже, а не форматированием подписи.
+    # "#SCAM" — кликабельная ссылка на самого бота; отправитель/получатель —
+    # кликабельные ссылки на профиль (tg://user?id=...); ⭐️ перед суммой.
+    bot_username = getattr(context.bot, "username", None)
+    scam_tag = f'<a href="https://t.me/{bot_username}">#SCAM</a>' if bot_username else "#SCAM"
+
     caption = (
-        "<b>🎭 #SCAM\n"
-        f"{mention(sender.id, sender.first_name)} отправил(а) "
+        f"<b>{scam_tag} {mention(sender.id, sender.first_name)} отправил(а) ⭐️ "
         f"{fmt_scam(amount)} SCAM для {mention(recipient.id, recipient.first_name)}</b>"
     )
 
