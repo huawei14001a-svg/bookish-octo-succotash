@@ -44,6 +44,9 @@ from telegram import (
     ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputMediaPhoto,
+    InputTextMessageContent,
     ReplyParameters,
     Update,
 )
@@ -54,6 +57,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
@@ -143,6 +147,7 @@ market_lock = asyncio.Lock()
 
 # ── Pending custom-amount input (ForceReply flow) ─────
 pending_input: dict = {}   # key: (cid, uid) -> {"kind":..., "tier":..., "expires":...}
+_scam_inline_processed: set = set()   # message keys already executed — защита от повторного нажатия "Подтвердить"
 
 
 # ══════════════════════════════════════════════════════
@@ -338,6 +343,22 @@ async def db_get_user(uid: int) -> Optional[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM users WHERE user_id=?", (uid,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def db_find_user_by_username(username: str) -> Optional[dict]:
+    """Ищет пользователя по username (без учёта регистра, без @).
+    Находит только тех, кого бот уже видел (db_ensure_user хотя бы раз) —
+    у Bot API нет способа резолвить произвольный @username в user_id."""
+    uname = username.lstrip("@").lower().strip()
+    if not uname:
+        return None
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM users WHERE LOWER(username)=? LIMIT 1", (uname,)
+        ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
 
@@ -786,7 +807,7 @@ SCAM_NUM_BBOX_FRAC   = (0.0859, 0.4111, 0.6805, 0.6958)   # крупная су�
 SCAM_LABEL_BBOX_FRAC = (0.6984, 0.6389, 0.8188, 0.6917)   # тег "SCAM"
 SCAM_USD_BBOX_FRAC   = (0.0961, 0.7625, 0.2844, 0.8653)   # "$ 0,00"
 
-SCAM_USD_DISPLAY = "1000.00 SCAM = 1$ "   # у SCAM нет рыночной цены — токен-шутка, всегда $0
+SCAM_USD_DISPLAY = "0,00"   # у SCAM нет рыночной цены — токен-шутка, всегда $0
 
 # Кастомный/премиум эмодзи-звезда перед суммой в подписи к переводу.
 # emoji-id можно заменить на любой другой валидный ID (см. /help раздел SCAM
@@ -1194,8 +1215,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/stakes — активные стейки, начисленный процент</li>"
         "</ul>"
         "<h3>🎭 Токен SCAM</h3>"
-        "<ul><li><code>пер 0,048</code> — перевести SCAM (ответом на сообщение получателя), "
-        "генерируется картинка-чек</li></ul>"
+        "<ul>"
+        "<li><code>пер 0,048</code> — перевести SCAM (ответом на сообщение получателя), "
+        "генерируется картинка-чек</li>"
+        "<li><b>Инлайн-режим</b> — работает в <u>любом чате</u>, даже без добавления бота: "
+        "<code>@bot_username получатель сумма</code>, например "
+        "<code>@bot_username botostroy 0,048</code></li>"
+        "</ul>"
         "<h3>👤 Аккаунт</h3>"
         "<ul><li>/balance — баланс USD/VRF/SCAM и суммарные активы</li></ul>"
         "<hr/>"
@@ -1213,6 +1239,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "💹 /market /buy /sell /chart\n"
         "🔒 /stake /stakes\n"
         "🎭 <code>пер 0,048</code> — перевод SCAM (ответом)\n"
+        "🎭 Инлайн (в любом чате): <code>@bot_username получатель сумма</code>\n"
         "👤 /balance\n\n"
         "Тарифы стейкинга:\n" +
         "\n".join(f"• {t['label']} — {t['apr']*100:.0f}% год." for t in STAKE_TIERS.values())
@@ -1690,7 +1717,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     query = update.callback_query
     data  = query.data
     who   = query.from_user
-    cid   = query.message.chat_id
+    # Инлайн-сообщения (нажатие кнопки под результатом инлайн-режима) не имеют
+    # query.message — только inline_message_id. cid нужен только обработчикам
+    # обычных (не-инлайн) callback'ов, поэтому просто None в инлайн-случае.
+    cid = query.message.chat_id if query.message else None
 
     # ── Exchange ──────────────────────────────────────
     if data.startswith("ex:"):
@@ -1995,6 +2025,119 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         return
 
+    # ── Инлайн-перевод SCAM (подтверждение/отмена) ───────
+    if data.startswith("iscam:"):
+        parts = data.split(":")
+        action = parts[1]
+
+        if action == "x":
+            sender_id = int(parts[2])
+            if who.id != sender_id:
+                await query.answer("❌ Отменить может только отправитель!", show_alert=True)
+                return
+            await query.answer("Отменено")
+            try:
+                if query.inline_message_id:
+                    await context.bot.edit_message_text(
+                        "❌ Перевод отменён.", inline_message_id=query.inline_message_id,
+                        reply_markup=None,
+                    )
+                elif query.message:
+                    await query.edit_message_text("❌ Перевод отменён.", reply_markup=None)
+            except TelegramError:
+                pass
+            return
+
+        if action == "c":
+            sender_id, recipient_id, amount = int(parts[2]), int(parts[3]), float(parts[4])
+            if who.id != sender_id:
+                await query.answer("❌ Подтвердить может только отправитель!", show_alert=True)
+                return
+
+            # Защита от повторного нажатия / повторной доставки апдейта Telegram:
+            # каждое конкретное сообщение-заявка может быть исполнено только один раз.
+            msg_key = query.inline_message_id or (
+                f"{query.message.chat_id}:{query.message.message_id}" if query.message else None
+            )
+            if msg_key and msg_key in _scam_inline_processed:
+                await query.answer("✅ Этот перевод уже был выполнен ранее", show_alert=True)
+                return
+            if msg_key:
+                _scam_inline_processed.add(msg_key)
+
+            recipient_row = await db_get_user(recipient_id)
+            if not recipient_row:
+                await query.answer("❌ Получатель не найден", show_alert=True)
+                return
+
+            class _RecipientRef:
+                pass
+            recipient_ref = _RecipientRef()
+            recipient_ref.id = recipient_id
+            recipient_ref.first_name = recipient_row["first_name"]
+            recipient_ref.username = recipient_row["username"]
+
+            ok, err, caption = await _do_scam_transfer_core(context, who, recipient_ref, amount)
+
+            if not ok:
+                await query.answer("❌ Не удалось перевести", show_alert=True)
+                if msg_key:
+                    _scam_inline_processed.discard(msg_key)  # не расходовали — можно попробовать снова
+                try:
+                    if query.inline_message_id:
+                        await context.bot.edit_message_text(
+                            err, inline_message_id=query.inline_message_id,
+                            parse_mode=ParseMode.HTML, reply_markup=None,
+                        )
+                    elif query.message:
+                        await query.edit_message_text(err, parse_mode=ParseMode.HTML, reply_markup=None)
+                except TelegramError:
+                    pass
+                return
+
+            await query.answer("✅ Переведено!")
+
+            loop = asyncio.get_running_loop()
+            img = await loop.run_in_executor(None, _scam_card_image_sync, amount)
+
+            # Пытаемся превратить сообщение-заявку в фото-чек на месте
+            # (edit_message_media работает и по inline_message_id, без
+            # необходимости боту состоять в этом чате); если не вышло —
+            # откатываемся на просто обновление текста. reply_markup=None
+            # обязательно — иначе кнопка "Подтвердить" останется висеть.
+            done = False
+            if img:
+                media = InputMediaPhoto(media=io.BytesIO(img), caption=caption, parse_mode=ParseMode.HTML)
+                try:
+                    if query.inline_message_id:
+                        await context.bot.edit_message_media(
+                            media=media, inline_message_id=query.inline_message_id, reply_markup=None,
+                        )
+                    elif query.message:
+                        await context.bot.edit_message_media(
+                            media=media, chat_id=query.message.chat_id,
+                            message_id=query.message.message_id, reply_markup=None,
+                        )
+                    done = True
+                except TelegramError:
+                    done = False
+
+            if not done:
+                try:
+                    if query.inline_message_id:
+                        await context.bot.edit_message_text(
+                            caption, inline_message_id=query.inline_message_id,
+                            parse_mode=ParseMode.HTML, reply_markup=None,
+                        )
+                    elif query.message:
+                        await query.edit_message_text(caption, parse_mode=ParseMode.HTML, reply_markup=None)
+                except TelegramError:
+                    pass
+            return
+
+        await query.answer()
+        return
+
     # ── API keys ────────────────────────────────────────
     if data.startswith("ak:"):
         _, action, kid_s = data.split(":")
@@ -2042,38 +2185,25 @@ async def _do_stake(uid: int, tier: str, amount: float) -> Tuple[bool, str]:
 #           MESSAGE HANDLER — custom amount replies
 # ══════════════════════════════════════════════════════
 
-async def _execute_scam_transfer(context, chat_id: int, cmd_msg_id: int,
-                                  recipient_msg, sender, recipient, amount: float) -> None:
-    """Deduct SCAM from sender, credit recipient, send a generated receipt image
-    as a reply-with-quote pointing at the recipient's original message (native
-    Telegram quote — reply_parameters.quote), not a formatting trick."""
+async def _do_scam_transfer_core(context, sender, recipient, amount: float) -> Tuple[bool, str, Optional[str]]:
+    """Проверяет и исполняет перевод SCAM (баланс + лог). Ничего не отправляет
+    в Telegram — это общая логика для reply-перевода ("пер") и инлайн-режима.
+    Возвращает (ok, сообщение_об_ошибке_или_пусто, готовый_html_caption_при_успехе)."""
     if recipient.id == sender.id:
-        await context.bot.send_message(chat_id, "❌ Нельзя переводить SCAM самому себе!",
-                                       reply_to_message_id=cmd_msg_id)
-        return
+        return False, "❌ Нельзя переводить SCAM самому себе!", None
     if amount <= 0:
-        await context.bot.send_message(chat_id, "❌ Сумма должна быть больше 0",
-                                       reply_to_message_id=cmd_msg_id)
-        return
+        return False, "❌ Сумма должна быть больше 0", None
 
     await db_ensure_user(sender.id, sender.username or "", sender.first_name)
     await db_ensure_user(recipient.id, getattr(recipient, "username", "") or "", recipient.first_name)
 
     su = await db_get_user(sender.id)
     if not su or su["scam"] < amount:
-        await context.bot.send_message(
-            chat_id,
-            f"❌ Недостаточно SCAM! Есть: <b>{fmt_scam(su['scam'] if su else 0)}</b>",
-            parse_mode=ParseMode.HTML, reply_to_message_id=cmd_msg_id,
-        )
-        return
+        return False, f"❌ Недостаточно SCAM! Есть: <b>{fmt_scam(su['scam'] if su else 0)}</b>", None
 
     await db_set_balances(sender.id, scam=su["scam"] - amount)
     await db_add_scam(recipient.id, amount)
     await db_log_scam_transfer(sender.id, recipient.id, amount)
-
-    loop = asyncio.get_running_loop()
-    img = await loop.run_in_executor(None, _scam_card_image_sync, amount)
 
     # "#SCAM" — кликабельная ссылка на самого бота; отправитель/получатель —
     # кликабельные ссылки на профиль (tg://user?id=...); ⭐️ — кастомный/
@@ -2086,6 +2216,22 @@ async def _execute_scam_transfer(context, chat_id: int, cmd_msg_id: int,
         f"<b>{scam_tag} {mention(sender.id, sender.first_name)} отправил(а) {star} "
         f"{fmt_scam(amount)} SCAM для {mention(recipient.id, recipient.first_name)}</b>"
     )
+    return True, "", caption
+
+
+async def _execute_scam_transfer(context, chat_id: int, cmd_msg_id: int,
+                                  recipient_msg, sender, recipient, amount: float) -> None:
+    """Deduct SCAM from sender, credit recipient, send a generated receipt image
+    as a reply-with-quote pointing at the recipient's original message (native
+    Telegram quote — reply_parameters.quote), not a formatting trick."""
+    ok, err, caption = await _do_scam_transfer_core(context, sender, recipient, amount)
+    if not ok:
+        await context.bot.send_message(chat_id, err, parse_mode=ParseMode.HTML,
+                                       reply_to_message_id=cmd_msg_id)
+        return
+
+    loop = asyncio.get_running_loop()
+    img = await loop.run_in_executor(None, _scam_card_image_sync, amount)
 
     # Цитата — короткий фрагмент исходного сообщения получателя (ровно то,
     # на которое ответили командой "пер"). Должна быть точной подстрокой,
@@ -2116,6 +2262,112 @@ async def _execute_scam_transfer(context, chat_id: int, cmd_msg_id: int,
                                          parse_mode=ParseMode.HTML)
         else:
             await context.bot.send_message(chat_id, caption, parse_mode=ParseMode.HTML)
+
+
+async def on_scam_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Инлайн-режим: @bot_username <получатель> <сумма> — работает в ЛЮБОМ чате,
+    даже если бот туда не добавлен. Получатель должен быть уже известен боту
+    (хотя бы раз написал /start кому-то из ботов этой базы), так как Bot API
+    не даёт резолвить произвольный @username в user_id."""
+    q = update.inline_query
+    who = q.from_user
+    text = (q.query or "").strip()
+
+    async def _answer(results):
+        try:
+            await q.answer(results, cache_time=1, is_personal=True)
+        except TelegramError:
+            pass
+
+    if not text:
+        await _answer([InlineQueryResultArticle(
+            id="help",
+            title="🎭 Перевод SCAM — как пользоваться",
+            description="Формат: получатель сумма, например: botostroy 0,048",
+            input_message_content=InputTextMessageContent(
+                "🎭 <b>Перевод SCAM через инлайн-режим</b>\n\n"
+                "Напиши в любом чате:\n"
+                f"<code>@{context.bot.username} получатель сумма</code>\n\n"
+                "Например: <code>botostroy 0,048</code>",
+                parse_mode=ParseMode.HTML,
+            ),
+        )])
+        return
+
+    tokens = text.split()
+    amount = None
+    uname_tokens = []
+    for t in tokens:
+        if amount is None:
+            try:
+                amount = float(t.replace(",", "."))
+                continue
+            except ValueError:
+                pass
+        uname_tokens.append(t)
+    username = " ".join(uname_tokens).lstrip("@").strip()
+
+    if amount is None or not username:
+        await _answer([InlineQueryResultArticle(
+            id="usage",
+            title="❌ Не понял запрос",
+            description="Формат: получатель сумма — например: botostroy 0,048",
+            input_message_content=InputTextMessageContent(
+                "❌ Формат: <code>получатель сумма</code>\nНапример: <code>botostroy 0,048</code>",
+                parse_mode=ParseMode.HTML,
+            ),
+        )])
+        return
+
+    if amount <= 0:
+        await _answer([InlineQueryResultArticle(
+            id="badamount", title="❌ Сумма должна быть больше 0",
+            input_message_content=InputTextMessageContent("❌ Сумма должна быть больше 0"),
+        )])
+        return
+
+    recipient_row = await db_find_user_by_username(username)
+    if not recipient_row:
+        await _answer([InlineQueryResultArticle(
+            id="notfound",
+            title=f"❌ @{username} не найден",
+            description="Получатель должен хотя бы раз написать боту /start",
+            input_message_content=InputTextMessageContent(
+                f"❌ Не могу найти @{username}. Получатель должен сначала хотя бы раз "
+                f"написать этому боту (/start), чтобы я знал его аккаунт."
+            ),
+        )])
+        return
+
+    if recipient_row["user_id"] == who.id:
+        await _answer([InlineQueryResultArticle(
+            id="self", title="❌ Нельзя переводить самому себе",
+            input_message_content=InputTextMessageContent("❌ Нельзя переводить SCAM самому себе!"),
+        )])
+        return
+
+    amt_str = fmt_scam(amount)
+    star = _tg_emoji(SCAM_STAR_EMOJI_ID, SCAM_STAR_FALLBACK)
+    recipient_label = f"@{recipient_row['username']}" if recipient_row["username"] else recipient_row["first_name"]
+
+    pending_text = (
+        f"🎭 <b>Перевод SCAM — ожидает подтверждения</b>\n\n"
+        f"{mention(who.id, who.first_name)} хочет перевести {star} "
+        f"<b>{amt_str} SCAM</b> для {mention(recipient_row['user_id'], recipient_row['first_name'])}\n\n"
+        f"👇 Подтвердить может только отправитель"
+    )
+    kb = InlineKeyboardMarkup([[
+        SBtn("✅ Подтвердить", style="success", callback_data=f"iscam:c:{who.id}:{recipient_row['user_id']}:{amount}"),
+        SBtn("❌ Отмена", style="danger", callback_data=f"iscam:x:{who.id}"),
+    ]])
+
+    await _answer([InlineQueryResultArticle(
+        id=f"send:{recipient_row['user_id']}:{amount}",
+        title=f"🎭 Перевести {amt_str} SCAM → {recipient_label}",
+        description=f"От {who.first_name} · нажми, чтобы вставить сообщение с подтверждением",
+        input_message_content=InputTextMessageContent(pending_text, parse_mode=ParseMode.HTML),
+        reply_markup=kb,
+    )])
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2599,12 +2851,13 @@ def main() -> None:
     app.add_handler(CommandHandler("addscam",  cmd_addscam))
 
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(InlineQueryHandler(on_scam_inline_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     log.info("Starting polling...")
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"],
+        allowed_updates=["message", "callback_query", "inline_query"],
     )
 
 
