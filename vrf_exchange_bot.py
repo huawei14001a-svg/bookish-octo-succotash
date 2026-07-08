@@ -707,7 +707,7 @@ def _price_chart_sync(rows: list) -> Optional[bytes]:
 
 
 # ══════════════════════════════════════════════════════
-#      SCAM TRANSFER CARD IMAGE  🎭  (Pillow + фото-шаблон)
+#      SCAM TRANSFER CARD IMAGE  (Pillow + фото-шаблон)
 # ══════════════════════════════════════════════════════
 # Рисует сумму поверх фиксированного фона (свой арт-дирекшн + иконки уже
 # вшиты в сам файл — код только позиционирует текст в размеченные под него
@@ -736,10 +736,10 @@ FONT_REG_PATHS = [
 ]
 
 try:
-    from scam_assets_data import SCAM_BG_B64, FONT_BOLD_B64, FONT_REG_B64
+    from scam_assets_data import SCAM_BG_B64, FONT_BOLD_B64, FONT_REG_B64, SEND_ARROW_ICON_B64
     _ASSETS_MODULE_FOUND = True
 except ImportError:
-    SCAM_BG_B64 = FONT_BOLD_B64 = FONT_REG_B64 = None
+    SCAM_BG_B64 = FONT_BOLD_B64 = FONT_REG_B64 = SEND_ARROW_ICON_B64 = None
     _ASSETS_MODULE_FOUND = False
 
 
@@ -752,9 +752,10 @@ def _b64_bytes(b64_str):
         return None
 
 
-_EMBEDDED_BG_BYTES   = _b64_bytes(SCAM_BG_B64)
-_EMBEDDED_BOLD_BYTES = _b64_bytes(FONT_BOLD_B64)
-_EMBEDDED_REG_BYTES  = _b64_bytes(FONT_REG_B64)
+_EMBEDDED_BG_BYTES    = _b64_bytes(SCAM_BG_B64)
+_EMBEDDED_BOLD_BYTES  = _b64_bytes(FONT_BOLD_B64)
+_EMBEDDED_REG_BYTES   = _b64_bytes(FONT_REG_B64)
+_EMBEDDED_ARROW_BYTES = _b64_bytes(SEND_ARROW_ICON_B64)
 
 
 # ── Диагностика assets ─────────────────────────────────
@@ -1006,16 +1007,21 @@ def _draw_spy_icon(d, x0: int, y0: int, x1: int, y1: int) -> None:
               fill=(255, 255, 255))
 
 
-def _draw_send_arrow(d, x: int, y: int, size: int) -> None:
-    w, h = size, size * 1.15
-    col = (215, 238, 250)
-    lw = max(3, size // 14)
-    apex     = (x + w * 0.5, y)
-    left_bot = (x + w * 0.30, y + h)
-    left_in  = (x + w * 0.30, y + h * 0.42)
-    right_in = (x + w * 0.70, y + h * 0.42)
-    right_bot = (x + w * 0.70, y + h)
-    d.line([left_bot, left_in, apex, right_in, right_bot], fill=col, width=lw, joint="curve")
+def _paste_send_arrow_icon(img, x: int, y: int, height: int) -> bool:
+    """Вставляет настоящую иконку стрелки (из scam_assets_data.py) поверх img,
+    с сохранением прозрачности. Возвращает True при успехе."""
+    if not _EMBEDDED_ARROW_BYTES:
+        return False
+    try:
+        from PIL import Image
+        icon = Image.open(io.BytesIO(_EMBEDDED_ARROW_BYTES)).convert("RGBA")
+        scale = height / icon.size[1]
+        new_size = (max(1, round(icon.size[0] * scale)), height)
+        icon = icon.resize(new_size, Image.LANCZOS)
+        img.paste(icon, (x, y), icon)
+        return True
+    except Exception:
+        return False
 
 
 def _scam_card_fallback_sync(amount: float) -> Optional[bytes]:
@@ -1029,10 +1035,21 @@ def _scam_card_fallback_sync(amount: float) -> Optional[bytes]:
         return None
 
     W, H = 1280, 720
-    img = _scam_bg_gradient(W, H)
+    img = _scam_bg_gradient(W, H).convert("RGBA")
     d = ImageDraw.Draw(img)
 
-    _draw_send_arrow(d, int(W * 0.078), int(H * 0.10), int(W * 0.075))
+    arrow_h = int(H * 0.15)
+    if not _paste_send_arrow_icon(img, int(W * 0.078), int(H * 0.07), arrow_h):
+        # Если иконки нет в scam_assets_data.py — старый нарисованный вариант как запасной
+        d.line(
+            [(int(W*0.078+W*0.075*0.30), int(H*0.10+H*0.086*1.15)),
+             (int(W*0.078+W*0.075*0.30), int(H*0.10+H*0.086*0.483)),
+             (int(W*0.078+W*0.075*0.5), int(H*0.10)),
+             (int(W*0.078+W*0.075*0.70), int(H*0.10+H*0.086*0.483)),
+             (int(W*0.078+W*0.075*0.70), int(H*0.10+H*0.086*1.15))],
+            fill=(215, 238, 250), width=max(3, int(W*0.075)//14), joint="curve",
+        )
+
     f_send, _ = _fit_text(d, "+SEND", "bold", int(W * 0.16), int(H * 0.08), max_size=60)
     d.text((int(W * 0.198), int(H * 0.155)), "+SEND", font=f_send, fill=(215, 238, 250))
 
@@ -1060,7 +1077,7 @@ def _scam_card_fallback_sync(amount: float) -> Optional[bytes]:
     draw_fitted(SCAM_USD_BBOX_FRAC, f"$ {SCAM_USD_DISPLAY}", GRAY)
 
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    img.convert("RGB").save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf.read()
 
@@ -1138,7 +1155,7 @@ async def _balance_cards(uid: int) -> Tuple[str, str]:
         f"<tr><td>{E_USD} USD</td><td align=\"right\"><b>{fmt(usd)}</b></td></tr>"
         f"<tr><td>{E_COIN} VRF</td><td align=\"right\"><b>{fmt(vrf)}</b> "
         f"<i>(~{fmt(vrf_value)} USD)</i></td></tr>"
-        f"<tr><td>🎭 SCAM</td><td align=\"right\"><b>{fmt_scam(scam)}</b></td></tr>"
+        f"<tr><td>SCAM</td><td align=\"right\"><b>{fmt_scam(scam)}</b></td></tr>"
         f"<tr><td>{E_LOCK} В стейке</td><td align=\"right\"><b>{fmt(staked_total)} VRF</b> "
         f"<i>(~{fmt(staked_value)} USD)</i></td></tr>"
         f"<tr><td>💠 Накоплено %</td><td align=\"right\"><b>{fmt(accrued_total)} VRF</b></td></tr>"
@@ -1149,7 +1166,7 @@ async def _balance_cards(uid: int) -> Tuple[str, str]:
         f"👤 <b>Баланс</b>\n\n"
         f"{E_USD} USD: <b>{fmt(usd)}</b>\n"
         f"{E_COIN} VRF: <b>{fmt(vrf)}</b> (~{fmt(vrf_value)} USD)\n"
-        f"🎭 SCAM: <b>{fmt_scam(scam)}</b>\n"
+        f"SCAM: <b>{fmt_scam(scam)}</b>\n"
         f"{E_LOCK} В стейке: <b>{fmt(staked_total)} VRF</b>\n"
         f"💠 Накоплено %: <b>{fmt(accrued_total)} VRF</b>\n\n"
         f"💼 Всего активов: <b>~{fmt(net_worth)} USD</b>"
@@ -1214,7 +1231,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/stake — выбрать тариф и положить VRF под процент</li>"
         "<li>/stakes — активные стейки, начисленный процент</li>"
         "</ul>"
-        "<h3>🎭 Токен SCAM</h3>"
+        "<h3>Токен SCAM</h3>"
         "<ul>"
         "<li><code>пер 0,048</code> — перевести SCAM (ответом на сообщение получателя), "
         "генерируется картинка-чек</li>"
@@ -1238,8 +1255,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📖 <b>Помощь — VRF Exchange</b>\n\n"
         "💹 /market /buy /sell /chart\n"
         "🔒 /stake /stakes\n"
-        "🎭 <code>пер 0,048</code> — перевод SCAM (ответом)\n"
-        "🎭 Инлайн (в любом чате): <code>@bot_username получатель сумма</code>\n"
+        "<code>пер 0,048</code> — перевод SCAM (ответом)\n"
+        "Инлайн (в любом чате): <code>@bot_username получатель сумма</code>\n"
         "👤 /balance\n\n"
         "Тарифы стейкинга:\n" +
         "\n".join(f"• {t['label']} — {t['apr']*100:.0f}% год." for t in STAKE_TIERS.values())
@@ -1660,7 +1677,7 @@ async def cmd_addscam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     new_bal = await db_add_scam(target.id, amount)
     await update.message.reply_text(
         f"✅ Выдано <b>{fmt_scam(amount)} SCAM</b> → {mention(target.id, target.first_name)}\n"
-        f"🎭 Баланс: {fmt_scam(new_bal)} SCAM",
+        f"Баланс: {fmt_scam(new_bal)} SCAM",
         parse_mode=ParseMode.HTML,
     )
 
@@ -2205,15 +2222,12 @@ async def _do_scam_transfer_core(context, sender, recipient, amount: float) -> T
     await db_add_scam(recipient.id, amount)
     await db_log_scam_transfer(sender.id, recipient.id, amount)
 
-    # "#SCAM" — кликабельная ссылка на самого бота; отправитель/получатель —
-    # кликабельные ссылки на профиль (tg://user?id=...); ⭐️ — кастомный/
-    # премиум эмодзи через <tg-emoji>, с юникод-fallback для старых клиентов.
-    bot_username = getattr(context.bot, "username", None)
-    scam_tag = f'<a href="https://t.me/{bot_username}">#SCAM</a>' if bot_username else "#SCAM"
+    # Отправитель/получатель — кликабельные ссылки на профиль (tg://user?id=...);
+    # ⭐️ — кастомный/премиум эмодзи через <tg-emoji>, с юникод-fallback.
     star = _tg_emoji(SCAM_STAR_EMOJI_ID, SCAM_STAR_FALLBACK)
 
     caption = (
-        f"<b>{scam_tag} {mention(sender.id, sender.first_name)} отправил(а) {star} "
+        f"<b>{mention(sender.id, sender.first_name)} отправил(а) {star} "
         f"{fmt_scam(amount)} SCAM для {mention(recipient.id, recipient.first_name)}</b>"
     )
     return True, "", caption
@@ -2282,10 +2296,10 @@ async def on_scam_inline_query(update: Update, context: ContextTypes.DEFAULT_TYP
     if not text:
         await _answer([InlineQueryResultArticle(
             id="help",
-            title="🎭 Перевод SCAM — как пользоваться",
+            title="Перевод SCAM — как пользоваться",
             description="Формат: получатель сумма, например: botostroy 0,048",
             input_message_content=InputTextMessageContent(
-                "🎭 <b>Перевод SCAM через инлайн-режим</b>\n\n"
+                "<b>Перевод SCAM через инлайн-режим</b>\n\n"
                 "Напиши в любом чате:\n"
                 f"<code>@{context.bot.username} получатель сумма</code>\n\n"
                 "Например: <code>botostroy 0,048</code>",
@@ -2351,7 +2365,7 @@ async def on_scam_inline_query(update: Update, context: ContextTypes.DEFAULT_TYP
     recipient_label = f"@{recipient_row['username']}" if recipient_row["username"] else recipient_row["first_name"]
 
     pending_text = (
-        f"🎭 <b>Перевод SCAM — ожидает подтверждения</b>\n\n"
+        f"<b>Перевод SCAM — ожидает подтверждения</b>\n\n"
         f"{mention(who.id, who.first_name)} хочет перевести {star} "
         f"<b>{amt_str} SCAM</b> для {mention(recipient_row['user_id'], recipient_row['first_name'])}\n\n"
         f"👇 Подтвердить может только отправитель"
@@ -2363,7 +2377,7 @@ async def on_scam_inline_query(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await _answer([InlineQueryResultArticle(
         id=f"send:{recipient_row['user_id']}:{amount}",
-        title=f"🎭 Перевести {amt_str} SCAM → {recipient_label}",
+        title=f"Перевести {amt_str} SCAM → {recipient_label}",
         description=f"От {who.first_name} · нажми, чтобы вставить сообщение с подтверждением",
         input_message_content=InputTextMessageContent(pending_text, parse_mode=ParseMode.HTML),
         reply_markup=kb,
