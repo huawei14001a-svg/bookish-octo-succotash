@@ -1,0 +1,6 @@
+python-telegram-bot==21.6
+aiosqlite==0.20.0
+matplotlib==3.9.2
+aiohttp==3.10.10
+Pillow==10.4.0
+numpy==2.1.2
