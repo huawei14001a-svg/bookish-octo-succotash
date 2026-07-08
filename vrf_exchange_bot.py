@@ -788,6 +788,18 @@ SCAM_USD_BBOX_FRAC   = (0.0961, 0.7625, 0.2844, 0.8653)   # "$ 0,00"
 
 SCAM_USD_DISPLAY = "0,00"   # у SCAM нет рыночной цены — токен-шутка, всегда $0
 
+# Кастомный/премиум эмодзи-звезда перед суммой в подписи к переводу.
+# emoji-id можно заменить на любой другой валидный ID (см. /help раздел SCAM
+# или README — как достать ID нужного эмодзи). fallback-символ показывается
+# в клиентах, которые не поддерживают кастомные эмодзи.
+SCAM_STAR_EMOJI_ID = "5363809721956477357"
+SCAM_STAR_FALLBACK = "⭐️"
+
+
+def _tg_emoji(emoji_id: str, fallback: str) -> str:
+    """HTML-тег кастомного/премиум эмодзи для parse_mode=HTML."""
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
 _SENTINEL_MISSING = object()
 _scam_bg_cache = None   # None = ещё не пробовали · _SENTINEL_MISSING = нигде не нашли · Image = загружен
 
@@ -2064,12 +2076,14 @@ async def _execute_scam_transfer(context, chat_id: int, cmd_msg_id: int,
     img = await loop.run_in_executor(None, _scam_card_image_sync, amount)
 
     # "#SCAM" — кликабельная ссылка на самого бота; отправитель/получатель —
-    # кликабельные ссылки на профиль (tg://user?id=...); ⭐️ перед суммой.
+    # кликабельные ссылки на профиль (tg://user?id=...); ⭐️ — кастомный/
+    # премиум эмодзи через <tg-emoji>, с юникод-fallback для старых клиентов.
     bot_username = getattr(context.bot, "username", None)
     scam_tag = f'<a href="https://t.me/{bot_username}">#SCAM</a>' if bot_username else "#SCAM"
+    star = _tg_emoji(SCAM_STAR_EMOJI_ID, SCAM_STAR_FALLBACK)
 
     caption = (
-        f"<b>{scam_tag} {mention(sender.id, sender.first_name)} отправил(а) ⭐️ "
+        f"<b>{scam_tag} {mention(sender.id, sender.first_name)} отправил(а) {star} "
         f"{fmt_scam(amount)} SCAM для {mention(recipient.id, recipient.first_name)}</b>"
     )
 
